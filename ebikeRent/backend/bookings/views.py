@@ -5,6 +5,7 @@ from rest_framework.permissions import IsAuthenticated
 from django_filters.rest_framework import DjangoFilterBackend
 from django.db.models import Q
 from django.utils import timezone
+from utils.logging import get_logger, log_api_request, log_api_response, log_api_error, log_user_action, log_business_event
 
 from .models import Booking, BookingStatus
 from .serializers import (
@@ -13,6 +14,8 @@ from .serializers import (
     BookingStatusUpdateSerializer,
 )
 from utils.response import api_response
+
+logger = get_logger("bookings")
 
 
 class BookingListAPIView(generics.ListAPIView):
@@ -32,6 +35,9 @@ class BookingListAPIView(generics.ListAPIView):
 
     def get_queryset(self):
         """Get bookings based on query parameters and user role."""
+        log_api_request(logger, self.request, "list_bookings", 
+                       filters=self.request.query_params)
+        
         user = self.request.user
         queryset = Booking.objects.select_related("bike", "renter").all()
 
@@ -40,14 +46,17 @@ class BookingListAPIView(generics.ListAPIView):
         if role == "renter":
             # Bookings where current user is the renter
             queryset = queryset.filter(renter=user)
+            log_user_action(logger, self.request, "list_renter_bookings")
         elif role == "owner":
             # Bookings for bikes owned by current user
             queryset = queryset.filter(bike__owner=user)
+            log_user_action(logger, self.request, "list_owner_bookings")
         else:
             # Default: show all bookings related to the user (as renter or bike owner)
             queryset = queryset.filter(
                 Q(renter=user) | Q(bike__owner=user)
             )
+            log_user_action(logger, self.request, "list_all_user_bookings")
 
         # Filter by date range
         start_date = self.request.query_params.get("start_date")
@@ -61,21 +70,32 @@ class BookingListAPIView(generics.ListAPIView):
 
     def list(self, request, *args, **kwargs):
         """Override list method to use custom response format."""
-        queryset = self.filter_queryset(self.get_queryset())
+        try:
+            queryset = self.filter_queryset(self.get_queryset())
+            count = queryset.count()
 
-        # Use pagination for requests without limit parameter
-        page = self.paginate_queryset(queryset)
-        if page is not None:
-            serializer = self.get_serializer(page, many=True)
-            return self.get_paginated_response(serializer.data)
+            # Use pagination for requests without limit parameter
+            page = self.paginate_queryset(queryset)
+            if page is not None:
+                serializer = self.get_serializer(page, many=True)
+                response = self.get_paginated_response(serializer.data)
+                log_api_response(logger, request, "list_bookings", status.HTTP_200_OK, 
+                               bookings_count=count, paginated=True)
+                return response
 
-        serializer = self.get_serializer(queryset, many=True)
-        return api_response(
-            success=True,
-            message="Bookings fetched successfully",
-            data=serializer.data,
-            status_code=status.HTTP_200_OK,
-        )
+            serializer = self.get_serializer(queryset, many=True)
+            response = api_response(
+                success=True,
+                message="Bookings fetched successfully",
+                data=serializer.data,
+                status_code=status.HTTP_200_OK,
+            )
+            log_api_response(logger, request, "list_bookings", status.HTTP_200_OK, 
+                           bookings_count=count, paginated=False)
+            return response
+        except Exception as e:
+            log_api_error(logger, request, "list_bookings", e)
+            raise
 
     def get_paginated_response(self, data):
         """Override to use custom response format even with pagination."""
@@ -100,23 +120,39 @@ class BookingCreateAPIView(generics.CreateAPIView):
 
     def create(self, request, *args, **kwargs):
         """Override create method to use custom response format."""
-        serializer = self.get_serializer(data=request.data)
-        if serializer.is_valid():
-            booking = serializer.save()
-            # Return full booking data using BookingSerializer
-            response_serializer = BookingSerializer(booking, context={"request": request})
+        log_api_request(logger, request, "create_booking", booking_data=request.data)
+        
+        try:
+            serializer = self.get_serializer(data=request.data)
+            if serializer.is_valid():
+                booking = serializer.save()
+                log_user_action(logger, request, "create_booking", resource_id=str(booking.id),
+                              bike_id=str(booking.bike.id), start_time=str(booking.start_time),
+                              end_time=str(booking.end_time))
+                
+                # Return full booking data using BookingSerializer
+                response_serializer = BookingSerializer(booking, context={"request": request})
+                response = api_response(
+                    success=True,
+                    message="Booking created successfully",
+                    data=response_serializer.data,
+                    status_code=status.HTTP_201_CREATED,
+                )
+                log_api_response(logger, request, "create_booking", status.HTTP_201_CREATED, 
+                               booking_id=str(booking.id))
+                return response
+            
+            log_api_response(logger, request, "create_booking", status.HTTP_400_BAD_REQUEST, 
+                           validation_errors=serializer.errors)
             return api_response(
-                success=True,
-                message="Booking created successfully",
-                data=response_serializer.data,
-                status_code=status.HTTP_201_CREATED,
+                success=False,
+                message="Invalid data",
+                data=serializer.errors,
+                status_code=status.HTTP_400_BAD_REQUEST,
             )
-        return api_response(
-            success=False,
-            message="Invalid data",
-            data=serializer.errors,
-            status_code=status.HTTP_400_BAD_REQUEST,
-        )
+        except Exception as e:
+            log_api_error(logger, request, "create_booking", e)
+            raise
 
 
 class BookingDetailAPIView(generics.RetrieveAPIView):
@@ -302,9 +338,12 @@ class BikeBookingsAPIView(generics.ListAPIView):
 @permission_classes([IsAuthenticated])
 def cancel_booking_api_view(request, pk):
     """Cancel a booking."""
+    log_api_request(logger, request, "cancel_booking", booking_id=pk)
+    
     try:
         booking = Booking.objects.select_related("bike", "renter").get(pk=pk)
     except Booking.DoesNotExist:
+        log_user_action(logger, request, "booking_not_found", resource_id=pk)
         return api_response(
             success=False,
             message="Booking not found",
@@ -315,6 +354,9 @@ def cancel_booking_api_view(request, pk):
     # Check permissions
     user = request.user
     if booking.renter != user and booking.bike.owner != user:
+        log_user_action(logger, request, "unauthorized_booking_cancel", 
+                       resource_id=pk, booking_renter_id=str(booking.renter.id),
+                       booking_owner_id=str(booking.bike.owner.id))
         return api_response(
             success=False,
             message="You don't have permission to cancel this booking",
@@ -324,6 +366,8 @@ def cancel_booking_api_view(request, pk):
 
     # Check if booking can be cancelled
     if booking.status in [BookingStatus.COMPLETED, BookingStatus.CANCELLED]:
+        log_user_action(logger, request, "invalid_booking_cancel", 
+                       resource_id=pk, current_status=booking.status)
         return api_response(
             success=False,
             message=f"Cannot cancel booking with status: {booking.status}",
@@ -332,17 +376,24 @@ def cancel_booking_api_view(request, pk):
         )
 
     # Cancel the booking
+    old_status = booking.status
     booking.status = BookingStatus.CANCELLED
     booking.save()
+    
+    log_user_action(logger, request, "cancel_booking", resource_id=str(booking.id),
+                   old_status=old_status, new_status=booking.status)
 
     # Return updated booking data
     serializer = BookingSerializer(booking, context={"request": request})
-    return api_response(
+    response = api_response(
         success=True,
         message="Booking cancelled successfully",
         data=serializer.data,
         status_code=status.HTTP_200_OK,
     )
+    log_api_response(logger, request, "cancel_booking", status.HTTP_200_OK, 
+                    booking_id=str(booking.id), old_status=old_status, new_status=booking.status)
+    return response
 
 
 @api_view(["POST"])

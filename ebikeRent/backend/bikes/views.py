@@ -10,6 +10,7 @@ from rest_framework.permissions import (
 )
 from django_filters.rest_framework import DjangoFilterBackend
 from django.db.models import Q
+from utils.logging import get_logger, log_api_request, log_api_response, log_api_error, log_user_action, log_business_event
 
 from .models import Bike, BikeImage, MaintenanceTicket
 from .serializers import (
@@ -18,6 +19,8 @@ from .serializers import (
     MaintenanceTicketSerializer,
 )
 from utils.response import api_response
+
+logger = get_logger("bikes")
 
 
 class BikeListAPIView(generics.ListAPIView):
@@ -37,22 +40,28 @@ class BikeListAPIView(generics.ListAPIView):
 
     def get_queryset(self):
         """Get bikes based on query parameters."""
+        log_api_request(logger, self.request, "list_bikes", 
+                       filters=self.request.query_params)
+        
         queryset = Bike.objects.select_related('owner').prefetch_related(
             'images',
             'favorited_by'
         )
-
+        
         # Filter by owner if requested
         owner = self.request.query_params.get("owner")
         if owner == "me" and self.request.user.is_authenticated:
             queryset = queryset.filter(owner=self.request.user)
+            log_user_action(logger, self.request, "list_my_bikes")
         elif owner and owner != "me":
             queryset = queryset.filter(owner__id=owner)
+            log_user_action(logger, self.request, "list_bikes_by_owner", owner_id=owner)
 
         # Filter by availability
         available_only = self.request.query_params.get("available_only")
         if available_only and available_only.lower() == "true":
             queryset = queryset.filter(status="available")
+            log_business_event(logger, "filter_available_bikes")
 
         # Filter by price range
         min_price = self.request.query_params.get("min_price")
@@ -66,21 +75,32 @@ class BikeListAPIView(generics.ListAPIView):
 
     def list(self, request, *args, **kwargs):
         """Override list method to use custom response format."""
-        queryset = self.filter_queryset(self.get_queryset())
+        try:
+            queryset = self.filter_queryset(self.get_queryset())
+            count = queryset.count()
 
-        # Use pagination for requests without limit parameter
-        page = self.paginate_queryset(queryset)
-        if page is not None:
-            serializer = self.get_serializer(page, many=True)
-            return self.get_paginated_response(serializer.data)
+            # Use pagination for requests without limit parameter
+            page = self.paginate_queryset(queryset)
+            if page is not None:
+                serializer = self.get_serializer(page, many=True)
+                response = self.get_paginated_response(serializer.data)
+                log_api_response(logger, request, "list_bikes", status.HTTP_200_OK, 
+                               bikes_count=count, paginated=True)
+                return response
 
-        serializer = self.get_serializer(queryset, many=True)
-        return api_response(
-            success=True,
-            message="Bikes fetched successfully",
-            data=serializer.data,
-            status_code=status.HTTP_200_OK,
-        )
+            serializer = self.get_serializer(queryset, many=True)
+            response = api_response(
+                success=True,
+                message="Bikes fetched successfully",
+                data=serializer.data,
+                status_code=status.HTTP_200_OK,
+            )
+            log_api_response(logger, request, "list_bikes", status.HTTP_200_OK, 
+                           bikes_count=count, paginated=False)
+            return response
+        except Exception as e:
+            log_api_error(logger, request, "list_bikes", e)
+            raise
 
     def get_paginated_response(self, data):
         """Override to use custom response format even with pagination."""
@@ -105,25 +125,40 @@ class BikeCreateAPIView(generics.CreateAPIView):
 
     def perform_create(self, serializer):
         """Set the owner to the current user when creating a bike."""
-        serializer.save(owner=self.request.user)
+        bike = serializer.save(owner=self.request.user)
+        log_user_action(logger, self.request, "create_bike", resource_id=str(bike.id),
+                       bike_title=bike.title, bike_location=bike.location)
+        return bike
 
     def create(self, request, *args, **kwargs):
         """Override create method to use custom response format."""
-        serializer = self.get_serializer(data=request.data)
-        if serializer.is_valid():
-            self.perform_create(serializer)
+        log_api_request(logger, request, "create_bike", bike_data=request.data)
+        
+        try:
+            serializer = self.get_serializer(data=request.data)
+            if serializer.is_valid():
+                bike = self.perform_create(serializer)
+                response = api_response(
+                    success=True,
+                    message="Bike created successfully",
+                    data=serializer.data,
+                    status_code=status.HTTP_201_CREATED,
+                )
+                log_api_response(logger, request, "create_bike", status.HTTP_201_CREATED, 
+                               bike_id=str(bike.id))
+                return response
+            
+            log_api_response(logger, request, "create_bike", status.HTTP_400_BAD_REQUEST, 
+                           validation_errors=serializer.errors)
             return api_response(
-                success=True,
-                message="Bike created successfully",
-                data=serializer.data,
-                status_code=status.HTTP_201_CREATED,
+                success=False,
+                message="Invalid data",
+                data=serializer.errors,
+                status_code=status.HTTP_400_BAD_REQUEST,
             )
-        return api_response(
-            success=False,
-            message="Invalid data",
-            data=serializer.errors,
-            status_code=status.HTTP_400_BAD_REQUEST,
-        )
+        except Exception as e:
+            log_api_error(logger, request, "create_bike", e)
+            raise
 
 
 class BikeDetailAPIView(generics.RetrieveUpdateDestroyAPIView):
@@ -146,56 +181,91 @@ class BikeDetailAPIView(generics.RetrieveUpdateDestroyAPIView):
 
     def retrieve(self, request, *args, **kwargs):
         """Override retrieve method to use custom response format."""
-        instance = self.get_object()
-        serializer = self.get_serializer(instance)
-        return api_response(
-            success=True,
-            message="Bike fetched successfully",
-            data=serializer.data,
-            status_code=status.HTTP_200_OK,
-        )
+        try:
+            instance = self.get_object()
+            log_api_request(logger, request, "retrieve_bike", bike_id=str(instance.id))
+            
+            serializer = self.get_serializer(instance)
+            response = api_response(
+                success=True,
+                message="Bike fetched successfully",
+                data=serializer.data,
+                status_code=status.HTTP_200_OK,
+            )
+            log_api_response(logger, request, "retrieve_bike", status.HTTP_200_OK, 
+                           bike_id=str(instance.id))
+            return response
+        except Exception as e:
+            log_api_error(logger, request, "retrieve_bike", e, bike_id=self.kwargs.get('pk'))
+            raise
 
     def update(self, request, *args, **kwargs):
         """Ensure only the owner can update their bike."""
-        bike = self.get_object()
-        if bike.owner != request.user:
-            return api_response(
-                success=False,
-                message="You can only update your own bikes.",
-                data=None,
-                status_code=status.HTTP_403_FORBIDDEN,
+        try:
+            bike = self.get_object()
+            log_api_request(logger, request, "update_bike", bike_id=str(bike.id), 
+                          update_data=request.data)
+            
+            if bike.owner != request.user:
+                log_user_action(logger, request, "unauthorized_bike_update", 
+                              resource_id=str(bike.id), bike_owner_id=str(bike.owner.id))
+                return api_response(
+                    success=False,
+                    message="You can only update your own bikes.",
+                    data=None,
+                    status_code=status.HTTP_403_FORBIDDEN,
+                )
+
+            partial = kwargs.pop("partial", False)
+            serializer = self.get_serializer(bike, data=request.data, partial=partial)
+            serializer.is_valid(raise_exception=True)
+            self.perform_update(serializer)
+
+            log_user_action(logger, request, "update_bike", resource_id=str(bike.id))
+            response = api_response(
+                success=True,
+                message="Bike updated successfully",
+                data=serializer.data,
+                status_code=status.HTTP_200_OK,
             )
-
-        partial = kwargs.pop("partial", False)
-        serializer = self.get_serializer(bike, data=request.data, partial=partial)
-        serializer.is_valid(raise_exception=True)
-        self.perform_update(serializer)
-
-        return api_response(
-            success=True,
-            message="Bike updated successfully",
-            data=serializer.data,
-            status_code=status.HTTP_200_OK,
-        )
+            log_api_response(logger, request, "update_bike", status.HTTP_200_OK, 
+                           bike_id=str(bike.id))
+            return response
+        except Exception as e:
+            log_api_error(logger, request, "update_bike", e, bike_id=self.kwargs.get('pk'))
+            raise
 
     def destroy(self, request, *args, **kwargs):
         """Ensure only the owner can delete their bike."""
-        bike = self.get_object()
-        if bike.owner != request.user:
-            return api_response(
-                success=False,
-                message="You can only delete your own bikes.",
-                data=None,
-                status_code=status.HTTP_403_FORBIDDEN,
-            )
+        try:
+            bike = self.get_object()
+            log_api_request(logger, request, "delete_bike", bike_id=str(bike.id))
+            
+            if bike.owner != request.user:
+                log_user_action(logger, request, "unauthorized_bike_delete", 
+                              resource_id=str(bike.id), bike_owner_id=str(bike.owner.id))
+                return api_response(
+                    success=False,
+                    message="You can only delete your own bikes.",
+                    data=None,
+                    status_code=status.HTTP_403_FORBIDDEN,
+                )
 
-        self.perform_destroy(bike)
-        return api_response(
-            success=True,
-            message="Bike deleted successfully",
-            data=None,
-            status_code=status.HTTP_204_NO_CONTENT,
-        )
+            log_user_action(logger, request, "delete_bike", resource_id=str(bike.id))
+            self.perform_destroy(bike)
+            
+            response = api_response(
+                success=True,
+                message="Bike deleted successfully",
+                data=None,
+                status_code=status.HTTP_204_NO_CONTENT,
+            )
+            log_api_response(logger, request, "delete_bike", status.HTTP_204_NO_CONTENT, 
+                           bike_id=str(bike.id))
+            return response
+        except Exception as e:
+            log_api_error(logger, request, "delete_bike", e, bike_id=self.kwargs.get('pk'))
+            raise
 
 
 class MyBikesAPIView(generics.ListAPIView):
@@ -212,20 +282,32 @@ class MyBikesAPIView(generics.ListAPIView):
 
     def list(self, request, *args, **kwargs):
         """Override list method to use custom response format."""
-        queryset = self.filter_queryset(self.get_queryset())
+        try:
+            log_api_request(logger, request, "list_my_bikes")
+            queryset = self.filter_queryset(self.get_queryset())
+            count = queryset.count()
 
-        page = self.paginate_queryset(queryset)
-        if page is not None:
-            serializer = self.get_serializer(page, many=True)
-            return self.get_paginated_response(serializer.data)
+            page = self.paginate_queryset(queryset)
+            if page is not None:
+                serializer = self.get_serializer(page, many=True)
+                response = self.get_paginated_response(serializer.data)
+                log_api_response(logger, request, "list_my_bikes", status.HTTP_200_OK, 
+                               bikes_count=count, paginated=True)
+                return response
 
-        serializer = self.get_serializer(queryset, many=True)
-        return api_response(
-            success=True,
-            message="Your bikes fetched successfully",
-            data=serializer.data,
-            status_code=status.HTTP_200_OK,
-        )
+            serializer = self.get_serializer(queryset, many=True)
+            response = api_response(
+                success=True,
+                message="Your bikes fetched successfully",
+                data=serializer.data,
+                status_code=status.HTTP_200_OK,
+            )
+            log_api_response(logger, request, "list_my_bikes", status.HTTP_200_OK, 
+                           bikes_count=count, paginated=False)
+            return response
+        except Exception as e:
+            log_api_error(logger, request, "list_my_bikes", e)
+            raise
 
     def get_paginated_response(self, data):
         """Override to use custom response format even with pagination."""
@@ -306,9 +388,13 @@ class MaintenanceTicketListCreateAPIView(generics.ListCreateAPIView):
 @permission_classes([IsAuthenticated])
 def toggle_bike_status_api_view(request, pk):
     """Toggle bike status between available and unavailable."""
+    log_api_request(logger, request, "toggle_bike_status", bike_id=pk)
+    
     try:
         bike = Bike.objects.get(pk=pk, owner=request.user)
     except Bike.DoesNotExist:
+        log_user_action(logger, request, "unauthorized_bike_status_toggle", 
+                       resource_id=pk, error="bike_not_found_or_not_owner")
         return api_response(
             success=False,
             message="Bike not found or you do not own this bike.",
@@ -316,6 +402,7 @@ def toggle_bike_status_api_view(request, pk):
             status_code=status.HTTP_404_NOT_FOUND,
         )
 
+    old_status = bike.status
     if bike.status == "available":
         bike.status = "unavailable"
         message = "Bike status changed to unavailable"
@@ -323,6 +410,8 @@ def toggle_bike_status_api_view(request, pk):
         bike.status = "available"
         message = "Bike status changed to available"
     else:
+        log_user_action(logger, request, "invalid_bike_status_toggle", 
+                       resource_id=pk, current_status=bike.status)
         return api_response(
             success=False,
             message="Cannot toggle bike status from maintenance mode",
@@ -331,13 +420,19 @@ def toggle_bike_status_api_view(request, pk):
         )
 
     bike.save()
+    log_user_action(logger, request, "toggle_bike_status", resource_id=str(bike.id),
+                   old_status=old_status, new_status=bike.status)
+    
     serializer = BikeSerializer(bike, context={"request": request})
-    return api_response(
+    response = api_response(
         success=True,
         message=message,
         data=serializer.data,
         status_code=status.HTTP_200_OK,
     )
+    log_api_response(logger, request, "toggle_bike_status", status.HTTP_200_OK, 
+                    bike_id=str(bike.id), old_status=old_status, new_status=bike.status)
+    return response
 
 
 class BikeImageListCreateAPIView(generics.ListCreateAPIView):

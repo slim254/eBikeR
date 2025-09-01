@@ -5,11 +5,14 @@ from rest_framework.permissions import IsAuthenticated, IsAuthenticatedOrReadOnl
 from django_filters.rest_framework import DjangoFilterBackend
 from django.db.models import Q, Avg, Count
 from django.db import models
+from utils.logging import get_logger, log_api_request, log_api_response, log_api_error, log_user_action, log_business_event
 
 from .models import Rating
 from .serializers import RatingSerializer, RatingCreateSerializer, RatingUpdateSerializer
 from bookings.models import Booking, BookingStatus
 from utils.response import api_response
+
+logger = get_logger("ratings")
 
 
 class RatingListAPIView(generics.ListAPIView):
@@ -29,22 +32,28 @@ class RatingListAPIView(generics.ListAPIView):
 
     def get_queryset(self):
         """Get ratings based on query parameters."""
+        log_api_request(logger, self.request, "list_ratings", 
+                       filters=self.request.query_params)
+        
         queryset = Rating.objects.select_related("bike", "user").all()
 
         # Filter by bike if requested
         bike_id = self.request.query_params.get("bike")
         if bike_id:
             queryset = queryset.filter(bike__id=bike_id)
+            log_business_event(logger, "filter_ratings_by_bike", bike_id=bike_id)
 
         # Filter by user if requested
         user_id = self.request.query_params.get("user")
         if user_id:
             queryset = queryset.filter(user__id=user_id)
+            log_business_event(logger, "filter_ratings_by_user", user_id=user_id)
 
         # Filter by minimum rating
         min_rating = self.request.query_params.get("min_rating")
         if min_rating:
             queryset = queryset.filter(rating__gte=min_rating)
+            log_business_event(logger, "filter_ratings_by_min_rating", min_rating=min_rating)
 
         return queryset
 
@@ -89,23 +98,38 @@ class RatingCreateAPIView(generics.CreateAPIView):
 
     def create(self, request, *args, **kwargs):
         """Override create method to use custom response format."""
-        serializer = self.get_serializer(data=request.data)
-        if serializer.is_valid():
-            rating = serializer.save()
-            # Return full rating data using RatingSerializer
-            response_serializer = RatingSerializer(rating, context={"request": request})
+        log_api_request(logger, request, "create_rating", rating_data=request.data)
+        
+        try:
+            serializer = self.get_serializer(data=request.data)
+            if serializer.is_valid():
+                rating = serializer.save()
+                log_user_action(logger, request, "create_rating", resource_id=str(rating.id),
+                              bike_id=str(rating.bike.id), rating_value=rating.rating)
+                
+                # Return full rating data using RatingSerializer
+                response_serializer = RatingSerializer(rating, context={"request": request})
+                response = api_response(
+                    success=True,
+                    message="Rating created successfully",
+                    data=response_serializer.data,
+                    status_code=status.HTTP_201_CREATED,
+                )
+                log_api_response(logger, request, "create_rating", status.HTTP_201_CREATED, 
+                               rating_id=str(rating.id), bike_id=str(rating.bike.id))
+                return response
+            
+            log_api_response(logger, request, "create_rating", status.HTTP_400_BAD_REQUEST, 
+                           validation_errors=serializer.errors)
             return api_response(
-                success=True,
-                message="Rating created successfully",
-                data=response_serializer.data,
-                status_code=status.HTTP_201_CREATED,
+                success=False,
+                message="Invalid data",
+                data=serializer.errors,
+                status_code=status.HTTP_400_BAD_REQUEST,
             )
-        return api_response(
-            success=False,
-            message="Invalid data",
-            data=serializer.errors,
-            status_code=status.HTTP_400_BAD_REQUEST,
-        )
+        except Exception as e:
+            log_api_error(logger, request, "create_rating", e)
+            raise
 
 
 class RatingDetailAPIView(generics.RetrieveUpdateDestroyAPIView):
